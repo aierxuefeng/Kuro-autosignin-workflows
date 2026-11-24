@@ -2,58 +2,84 @@ name: Auto Checkin Job
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    # 一天三个槽位：北京 10:41 / 14:41 / 18:41
+    # 原本的 '0 0 * * *' 是 UTC 零点整，全平台最拥堵的那一分钟，实测被延迟 5 小时以上。
+    - cron: '41 2,6,10 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: kuro-daily
+  cancel-in-progress: false
 
 jobs:
   auto-sign:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      # 1. 检出代码
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: 判断今天是否已经成功过
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          DONE=$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow "$GITHUB_WORKFLOW" \
+            --status success \
+            --limit 20 \
+            --json createdAt,databaseId \
+            --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID) | select(.createdAt | startswith(\"$TODAY\"))] | length")
+          echo "今日已成功运行次数：$DONE"
+          if [ "$DONE" -gt 0 ]; then
+            echo "need=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "need=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      # 2. 设置 Python 环境
+      - name: Checkout code
+        if: steps.guard.outputs.need == 'true'
+        uses: actions/checkout@v4
+
       - name: Set up Python
+        if: steps.guard.outputs.need == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      # 3. 手动缓存依赖
       - name: Cache pip packages
-        uses: actions/cache@v3
+        if: steps.guard.outputs.need == 'true'
+        uses: actions/cache@v4
         with:
-          path: ~/.cache/pip  # pip 默认缓存路径
+          path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 4. 安装依赖
       - name: Install dependencies
+        if: steps.guard.outputs.need == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 5. 生成 1 到 5 分钟的随机等待时间
       - name: Generate random wait time (1-5 minutes)
+        if: steps.guard.outputs.need == 'true'
         id: random_wait
         run: |
-          # 生成 1 到 5 之间的随机数（分钟）
           RANDOM_WAIT=$(( (RANDOM % 5) + 1 ))
           echo "随机等待时间: $RANDOM_WAIT 分钟"
-
-          # 将分钟转换为秒
           WAIT_SECONDS=$((RANDOM_WAIT * 60))
           echo "等待时间: $WAIT_SECONDS 秒"
-
-          # 等待到随机时间
           sleep $WAIT_SECONDS
 
-      # 6. 运行脚本
+      # 原文件这里是 continue-on-error: true，签到失败也会显示绿色成功，
+      # 你会长期以为自己还在签到。这里去掉，让失败真的变成红色。
       - name: Run auto checkin script
+        if: steps.guard.outputs.need == 'true'
         id: run_script
-        continue-on-error: true
         env:
           CONFIGS: ${{ secrets.CONFIGS }}
         run: |
